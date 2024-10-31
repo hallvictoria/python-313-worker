@@ -44,6 +44,7 @@ from .utils.env_state import get_app_setting, is_envvar_true
 
 metadata_result: str = ""
 metadata_exception: Optional[Exception] = None
+result = None # Todo: type is coroutine?
 
 class StringifyEnum(Enum):
     """This class output name of enum object when printed as string."""
@@ -97,6 +98,7 @@ async def worker_init_request(self, request, protos):
     # global MR & ME & result
     # result = asyncio.createTask(indexing) -- MR / ME set in indexing
     try:
+        global result
         result = asyncio.create_task(load_function_metadata(worker_init_request.function_app_directory,
                                                             caller_info="worker_init_request"))
         if get_app_setting(setting=PYTHON_ENABLE_INIT_INDEXING): # PYTHON_ENABLE_HTTP_STREAMING
@@ -112,7 +114,7 @@ async def worker_init_request(self, request, protos):
         WorkerResponse(name="worker_init_request",
                        status=Status.ERROR,
                        result={"capabilities": capabilities},
-                       exception={"status_code": ex.status, "type": type(ex), "message": ex})
+                       exception={"status_code": ex.status_code, "type": type(ex), "message": ex}) # Todo: syntax for getting exception status code
 
     return WorkerResponse(name="worker_init_request",
                           status=Status.SUCCESS,
@@ -120,28 +122,30 @@ async def worker_init_request(self, request, protos):
                           exception={"status_code": 200, "type": None, "message": None})
 
 
-#handle__worker_status_request can be done in the proxy worker
+# worker_status_request can be done in the proxy worker
 
 async def functions_metadata_request(self, request):
     metadata_request = request.functions_metadata_request
     function_app_directory = metadata_request.function_app_directory
 
-    # Todo: just await metadata result and exception
-    # await result
-    # If ME return exception, else return MR
-    if not is_envvar_true(PYTHON_ENABLE_INIT_INDEXING):
-        try:
-            # Todo: refactor this function
-            self.load_function_metadata(
-                function_app_directory,
-                caller_info="functions_metadata_request")
-        except Exception as ex:
-            # Todo: save the exception
-            self._function_metadata_exception = ex
+    # Todo: should there be a check on if result is None?
+    global result, metadata_result, metadata_exception
+    await result
+
+    if metadata_exception:
+        return WorkerResponse(name="functions_metadata_request",
+                              status=Status.ERROR,
+                              result={},  # We don't need to send anything if there's an error
+                              exception={"status_code": metadata_exception.status, "type": type(metadata_exception), "message": metadata_exception})
+    else:
+        return WorkerResponse(name="functions_metadata_request",
+                              status=Status.SUCCESS,
+                              result={"function_metadata": metadata_result},
+                              exception={"status_code": 200, "type": None, "message": None})
 
 
-async def function_load_request(self, request):
-    # no op because indexing in init / env reload
+# worker_load_request can be done in the proxy worker
+# no-op in library because indexing is done in init / env reload
 
 
 async def invocation_request(self, request):
@@ -150,8 +154,6 @@ async def invocation_request(self, request):
     invocation_id = invoc_request.invocation_id
     function_id = invoc_request.function_id
     http_v2_enabled = False
-
-    # Removed loop setting info
 
     try:
         # Todo: refactor functions.py
@@ -268,15 +270,20 @@ async def invocation_request(self, request):
         # Actively flush customer print() function to console
         sys.stdout.flush()
 
-        # Todo: return appropriate dict
-        return {}
+        return WorkerResponse(name="invocation_request",
+                              status=Status.SUCCESS,
+                              result={"return_value": return_value, "output_data": output_data},
+                              exception={"status_code": 200, "type": None, "message": None})
 
     except Exception as ex:
         if http_v2_enabled:
             http_coordinator.set_http_response(invocation_id, ex)
 
-        # Todo: return appropriate dict
-        return {}
+        WorkerResponse(name="invocation_request",
+                       status=Status.ERROR,
+                       result={},  # We don't need to send anything if there's an error
+                       exception={"status_code": metadata_exception.status, "type": type(metadata_exception),
+                                  "message": metadata_exception})
 
 
 async def function_environment_reload_request(self, request):
@@ -296,7 +303,7 @@ async def function_environment_reload_request(self, request):
 
         # calling load_binding_registry again since the
         # reload_customer_libraries call clears the registry
-        bindings.load_binding_registry()
+        load_binding_registry()
 
         capabilities = {}
         if get_app_setting(
@@ -308,21 +315,16 @@ async def function_environment_reload_request(self, request):
                 capabilities[WORKER_OPEN_TELEMETRY_ENABLED] = (
                     TRUE)
 
-        if is_envvar_true(PYTHON_ENABLE_INIT_INDEXING):
-            try:
-                # Todo: save and handle all this data appropriately
-                self.load_function_metadata(
-                    directory,
-                    caller_info="environment_reload_request")
-
-                if HttpV2Registry.http_v2_enabled():
-                    capabilities[HTTP_URI] = \
-                        initialize_http_server(self._host)
-                    capabilities[REQUIRES_ROUTE_PARAMETERS] = TRUE
-            except HttpServerInitError:
-                raise
-            except Exception as ex:
-                self._function_metadata_exception = ex
+        try:
+            global result
+            result = asyncio.create_task(load_function_metadata(directory,
+                                                                caller_info="environment_reload_request"))
+            if get_app_setting(setting=PYTHON_ENABLE_INIT_INDEXING):  # PYTHON_ENABLE_HTTP_STREAMING
+                capabilities[HTTP_URI] = \
+                    initialize_http_server(self._host)
+                capabilities[REQUIRES_ROUTE_PARAMETERS] = TRUE
+        except HttpServerInitError:
+            raise
 
         # Change function app directory
         if getattr(func_env_reload_request,
@@ -330,9 +332,17 @@ async def function_environment_reload_request(self, request):
             self._change_cwd(
                 func_env_reload_request.function_app_directory)
 
-        # Todo: return appropriate dict
-        return {}
+        return WorkerResponse(name="function_environment_reload_request",
+                              status=Status.SUCCESS,
+                              result={"capabilities": capabilities},
+                              exception={"status_code": 200, "type": None, "message": None})
 
     except Exception as ex:
-        # Todo: save and surface exception
-        return {}
+        # Todo: Do we need to save metadata_exception here?
+        global metadata_exception
+        metadata_exception = ex
+        WorkerResponse(name="function_environment_reload_request",
+                       status=Status.ERROR,
+                       result={"capabilities": capabilities},
+                       exception={"status_code": ex.status_code, "type": type(ex),
+                                  "message": ex})  # Todo: syntax for getting exception status code
