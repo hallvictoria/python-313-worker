@@ -3,8 +3,8 @@
 
 from typing import Any, Callable
 
-from ..logging import error_logger, logger
-from .common import is_envvar_false, is_envvar_true
+#from ..logging import error_logger, logger
+from .env_state import is_envvar_false, is_envvar_true
 from .tracing import extend_exception_message
 
 
