@@ -122,7 +122,7 @@ async def worker_init_request(request):
         # Todo: Do we need to save metadata_exception here?
         global metadata_exception
         metadata_exception = ex
-        WorkerResponse(name="worker_init_request",
+        return WorkerResponse(name="worker_init_request",
                        status=Status.ERROR,
                        result={"capabilities": capabilities},
                        exception={"status_code": ex.status_code, "type": type(ex), "message": ex}) # Todo: syntax for getting exception status code
@@ -285,7 +285,7 @@ async def invocation_request(request):
         if http_v2_enabled:
             http_coordinator.set_http_response(invocation_id, ex)
 
-        WorkerResponse(name="invocation_request",
+        return WorkerResponse(name="invocation_request",
                        status=Status.ERROR,
                        result={},  # We don't need to send anything if there's an error
                        exception={"status_code": metadata_exception.status, "type": type(metadata_exception),
@@ -347,7 +347,7 @@ async def function_environment_reload_request(request):
         # Todo: Do we need to save metadata_exception here?
         global metadata_exception
         metadata_exception = ex
-        WorkerResponse(name="function_environment_reload_request",
+        return WorkerResponse(name="function_environment_reload_request",
                        status=Status.ERROR,
                        result={"capabilities": capabilities},
                        exception={"status_code": ex.status_code, "type": type(ex),
