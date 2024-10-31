@@ -3,6 +3,8 @@
 
 import os
 
+from ..logging import logger
+
 
 def change_cwd(new_cwd: str):
     if os.path.exists(new_cwd):

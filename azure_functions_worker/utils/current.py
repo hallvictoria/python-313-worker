@@ -2,14 +2,9 @@
 # Licensed under the MIT License.
 
 import asyncio
-import concurrent
 import functools
 
-from typing import Any, Optional
-
-from .constants import PYTHON_THREADPOOL_THREAD_COUNT
-from .env_state import get_app_setting
-from .validators import tp_max_workers_validator
+from typing import Any
 
 from ..otel import OTelManager, configure_opentelemetry
 

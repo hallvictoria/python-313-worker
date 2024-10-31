@@ -21,12 +21,10 @@ from .http_v2 import (
 from .loader import index_function_app, process_indexed_function
 from .logging import logger
 from .otel import OTelManager, initialize_azure_monitor, configure_opentelemetry
-from .version import VERSION
 
 from .bindings.context import _get_context
 from .bindings.meta import load_binding_registry, is_trigger_binding, from_incoming_proto, to_outgoing_param_binding, to_outgoing_proto
 from .bindings.out import Out
-from .utils.app_setting_state import get_python_appsetting_state
 from .utils.constants import (FUNCTION_DATA_CACHE,
                               RAW_HTTP_BODY_BYTES,
                               TYPED_DATA_COLLECTION,
@@ -34,7 +32,7 @@ from .utils.constants import (FUNCTION_DATA_CACHE,
                               WORKER_STATUS,
                               RPC_HTTP_TRIGGER_METADATA_REMOVED,
                               SHARED_MEMORY_DATA_TRANSFER,
-                              TRUE, TRACEPARENT, TRACESTATE,
+                              TRUE,
                               PYTHON_ENABLE_OPENTELEMETRY,
                               PYTHON_ENABLE_OPENTELEMETRY_DEFAULT,
                               WORKER_OPEN_TELEMETRY_ENABLED,
@@ -43,7 +41,6 @@ from .utils.constants import (FUNCTION_DATA_CACHE,
                               REQUIRES_ROUTE_PARAMETERS,
                               PYTHON_SCRIPT_FILE_NAME,
                               PYTHON_SCRIPT_FILE_NAME_DEFAULT,
-                              METADATA_PROPERTIES_WORKER_INDEXED,
                               PYTHON_ENABLE_DEBUG_LOGGING)
 from .utils.current import get_current_loop, execute, run_sync_func
 from .utils.env_state import get_app_setting, is_envvar_true
