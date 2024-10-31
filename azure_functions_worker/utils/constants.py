@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 # TODO: organize this better
+
 import sys
 
 TRUE = "true"

@@ -1,22 +1,23 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
-"""Python functions loader."""
+
 import importlib
 import importlib.machinery
-import os
 import os.path
 import pathlib
 import sys
 import time
+
 from datetime import timedelta
-from os import PathLike, fspath
 from typing import Dict, Optional
 
-from google.protobuf.duration_pb2 import Duration
 
-from . import bindings, functions, protos
+from .functions import Registry
+from .logging import logger
+
+from bindings.meta import get_deferred_raw_bindings
 from .bindings.retrycontext import RetryPolicy
-from .constants import (
+from .utils.constants import (
     CUSTOMER_PACKAGES_PATH,
     METADATA_PROPERTIES_WORKER_INDEXED,
     MODULE_NOT_FOUND_TS_URL,
@@ -25,9 +26,13 @@ from .constants import (
     PYTHON_SCRIPT_FILE_NAME_DEFAULT,
     RETRY_POLICY,
 )
-from .logging import logger
-from .utils.common import get_app_setting
+from .utils.env_state import get_app_setting
 from .utils.wrappers import attach_message_to_exception
+
+_AZURE_NAMESPACE = '__app__'
+_DEFAULT_SCRIPT_FILENAME = '__init__.py'
+_DEFAULT_ENTRY_POINT = 'main'
+_submodule_dirs = []
 
 
 def convert_to_seconds(timestr: str):
@@ -36,7 +41,7 @@ def convert_to_seconds(timestr: str):
                          seconds=x.tm_sec).total_seconds())
 
 
-def build_binding_protos(indexed_function) -> Dict:
+def build_binding_protos(protos, indexed_function) -> Dict:
     binding_protos = {}
     for binding in indexed_function.get_bindings():
         binding_protos[binding.name] = protos.BindingInfo(
@@ -47,7 +52,7 @@ def build_binding_protos(indexed_function) -> Dict:
     return binding_protos
 
 
-def build_retry_protos(indexed_function) -> Dict:
+def build_retry_protos(protos, indexed_function) -> Dict:
     retry = get_retry_settings(indexed_function)
 
     if not retry:
@@ -58,9 +63,9 @@ def build_retry_protos(indexed_function) -> Dict:
     retry_strategy = retry.get(RetryPolicy.STRATEGY.value)
 
     if strategy == "fixed_delay":
-        return build_fixed_delay_retry(retry, max_retry_count, retry_strategy)
+        return build_fixed_delay_retry(protos, retry, max_retry_count, retry_strategy)
     else:
-        return build_variable_interval_retry(retry, max_retry_count,
+        return build_variable_interval_retry(protos, retry, max_retry_count,
                                              retry_strategy)
 
 
@@ -72,8 +77,8 @@ def get_retry_settings(indexed_function):
         return None
 
 
-def build_fixed_delay_retry(retry, max_retry_count, retry_strategy):
-    delay_interval = Duration(
+def build_fixed_delay_retry(protos, retry, max_retry_count, retry_strategy):
+    delay_interval = protos.Duration(
         seconds=convert_to_seconds(retry.get(RetryPolicy.DELAY_INTERVAL.value))
     )
     return protos.RpcRetryOptions(
@@ -83,12 +88,12 @@ def build_fixed_delay_retry(retry, max_retry_count, retry_strategy):
     )
 
 
-def build_variable_interval_retry(retry, max_retry_count, retry_strategy):
-    minimum_interval = Duration(
+def build_variable_interval_retry(protos, retry, max_retry_count, retry_strategy):
+    minimum_interval = protos.Duration(
         seconds=convert_to_seconds(
             retry.get(RetryPolicy.MINIMUM_INTERVAL.value))
     )
-    maximum_interval = Duration(
+    maximum_interval = protos.Duration(
         seconds=convert_to_seconds(
             retry.get(RetryPolicy.MAXIMUM_INTERVAL.value))
     )
@@ -100,7 +105,8 @@ def build_variable_interval_retry(retry, max_retry_count, retry_strategy):
     )
 
 
-def process_indexed_function(functions_registry: functions.Registry,
+def process_indexed_function(protos,
+                             functions_registry: Registry,
                              indexed_functions, function_dir):
     """
     fx_metadata_results is a list of the RpcFunctionMetadata for
@@ -117,10 +123,10 @@ def process_indexed_function(functions_registry: functions.Registry,
     fx_bindings_logs = {}
     for indexed_function in indexed_functions:
         function_info = functions_registry.add_indexed_function(
-            function=indexed_function)
+            function=indexed_function, protos=protos)
 
-        binding_protos = build_binding_protos(indexed_function)
-        retry_protos = build_retry_protos(indexed_function)
+        binding_protos = build_binding_protos(protos, indexed_function)
+        retry_protos = build_retry_protos(protos, indexed_function)
 
         raw_bindings, bindings_logs = get_fx_raw_bindings(
             indexed_function=indexed_function,
@@ -196,7 +202,7 @@ def get_fx_raw_bindings(indexed_function, function_info):
     for this function.
     """
     if function_info.deferred_bindings_enabled:
-        raw_bindings, bindings_logs = bindings.get_deferred_raw_bindings(
+        raw_bindings, bindings_logs = get_deferred_raw_bindings(
             indexed_function, function_info.input_types)
         return raw_bindings, bindings_logs
 

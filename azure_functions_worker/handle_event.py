@@ -10,7 +10,7 @@ from datetime import datetime
 from enum import Enum
 from typing import List, Optional
 
-from .functions import index_functions
+from .functions import FunctionInfo, Registry
 from .http_v2 import (
     HttpServerInitError,
     HttpV2Registry,
@@ -18,9 +18,14 @@ from .http_v2 import (
     initialize_http_server,
     sync_http_request,
 )
+from .loader import index_function_app, process_indexed_function
+from .logging import logger
+from .otel import OTelManager, initialize_azure_monitor, configure_opentelemetry
 from .version import VERSION
 
-from .bindings.meta import load_binding_registry
+from .bindings.context import _get_context
+from .bindings.meta import load_binding_registry, is_trigger_binding, from_incoming_proto, to_outgoing_param_binding, to_outgoing_proto
+from .bindings.out import Out
 from .utils.app_setting_state import get_python_appsetting_state
 from .utils.constants import (FUNCTION_DATA_CACHE,
                               RAW_HTTP_BODY_BYTES,
@@ -40,16 +45,24 @@ from .utils.constants import (FUNCTION_DATA_CACHE,
                               PYTHON_SCRIPT_FILE_NAME_DEFAULT,
                               METADATA_PROPERTIES_WORKER_INDEXED,
                               PYTHON_ENABLE_DEBUG_LOGGING)
+from .utils.current import get_current_loop, execute, run_sync_func
 from .utils.env_state import get_app_setting, is_envvar_true
+from .utils.path import change_cwd
+from .utils.validators import validate_script_file_name
 
 metadata_result: str = ""
 metadata_exception: Optional[Exception] = None
-result = None # Todo: type is coroutine?
+result = None  # Todo: type is coroutine?
+_functions = Registry()
+_function_data_cache_enabled: bool = False
+_host: str = None
+
 
 class StringifyEnum(Enum):
     """This class output name of enum object when printed as string."""
     def __str__(self):
         return str(self.name)
+
 
 class Status(StringifyEnum):
     SUCCESS = 200
@@ -58,7 +71,6 @@ class Status(StringifyEnum):
 
 class WorkerResponse:
     def __init__(self, name: Optional[str] = None, status: Optional[Status] = None, result: Optional[dict] = None, exception: Optional[dict] = None):
-        # WorkerResponse(name: "init response", status: ENUM.success, result: {"capabilities": "", <varies by request type>}, exception: {status_code: "", type: "", message: ""})
         self._name = name
         self._status = status
         self._result = result
@@ -66,12 +78,15 @@ class WorkerResponse:
 
 
 # Protos will be the retry / binding / metadata protos object that we populate and return
-async def worker_init_request(self, request, protos):
-    worker_init_request = request.worker_init_request
-    host_capabilities = worker_init_request.capabilities
+async def worker_init_request(request):
+    global result, _host, _function_data_cache_enabled
+    init_request = request.request.worker_init_request
+    host_capabilities = init_request.capabilities
+    _host = request.properties.get("host")
+    protos = request.properties.get("protos")
     if FUNCTION_DATA_CACHE in host_capabilities:
         val = host_capabilities[FUNCTION_DATA_CACHE]
-        self._function_data_cache_enabled = val == TRUE
+        _function_data_cache_enabled = val == TRUE
 
     capabilities = {
         RAW_HTTP_BODY_BYTES: TRUE,
@@ -83,10 +98,9 @@ async def worker_init_request(self, request, protos):
     }
     if get_app_setting(setting=PYTHON_ENABLE_OPENTELEMETRY,
                        default_value=PYTHON_ENABLE_OPENTELEMETRY_DEFAULT):
-        # Todo: Refactor open telemetry setup into separate file
-        self.initialize_azure_monitor()
+        initialize_azure_monitor()
 
-        if self._azure_monitor_available:
+        if OTelManager.get_azure_monitor_available():
             capabilities[WORKER_OPEN_TELEMETRY_ENABLED] = TRUE
 
 
@@ -94,16 +108,13 @@ async def worker_init_request(self, request, protos):
     # dictionary which will be later used in the invocation request
     load_binding_registry()
 
-    # TODO: load_function_metadata
-    # global MR & ME & result
-    # result = asyncio.createTask(indexing) -- MR / ME set in indexing
     try:
-        global result
-        result = asyncio.create_task(load_function_metadata(worker_init_request.function_app_directory,
+        result = asyncio.create_task(load_function_metadata(protos,
+                                                            init_request.function_app_directory,
                                                             caller_info="worker_init_request"))
         if get_app_setting(setting=PYTHON_ENABLE_INIT_INDEXING): # PYTHON_ENABLE_HTTP_STREAMING
             capabilities[HTTP_URI] = \
-                initialize_http_server(self._host)
+                initialize_http_server(_host)
             capabilities[REQUIRES_ROUTE_PARAMETERS] = TRUE
     except HttpServerInitError:
         raise
@@ -124,7 +135,7 @@ async def worker_init_request(self, request, protos):
 
 # worker_status_request can be done in the proxy worker
 
-async def functions_metadata_request(self, request):
+async def functions_metadata_request(request):
     metadata_request = request.functions_metadata_request
     function_app_directory = metadata_request.function_app_directory
 
@@ -148,55 +159,50 @@ async def functions_metadata_request(self, request):
 # no-op in library because indexing is done in init / env reload
 
 
-async def invocation_request(self, request):
+async def invocation_request(request):
     invocation_time = datetime.now()
-    invoc_request = request.invocation_request
+    invoc_request = request.request.invocation_request
     invocation_id = invoc_request.invocation_id
     function_id = invoc_request.function_id
     http_v2_enabled = False
+    protos = request.properties.get("protos")
+    threadpool = request.properties.get("threadpool")
 
     try:
-        # Todo: refactor functions.py
-        fi: functions.FunctionInfo = self._functions.get_function(
+        fi: FunctionInfo = _functions.get_function(
             function_id)
         assert fi is not None
 
         function_invocation_logs: List[str] = [
             'Received FunctionInvocationRequest',
-            f'request ID: {self.request_id}',
             f'function ID: {function_id}',
             f'function name: {fi.name}',
             f'invocation ID: {invocation_id}',
             f'function type: {"async" if fi.is_async else "sync"}',
             f'timestamp (UTC): {invocation_time}'
         ]
-        if not fi.is_async:
-            function_invocation_logs.append(
-                f'sync threadpool max workers: '
-                f'{self.get_sync_tp_workers_set()}'
-            )
+
         logger.info(', '.join(function_invocation_logs))
 
         args = {}
 
-        http_v2_enabled = self._functions.get_function(function_id) \
-                              .is_http_func and \
+        http_v2_enabled = _functions.get_function(
+            function_id).is_http_func and \
             HttpV2Registry.http_v2_enabled()
 
         for pb in invoc_request.input_data:
             pb_type_info = fi.input_types[pb.name]
-            if bindings.is_trigger_binding(pb_type_info.binding_name):
+            if is_trigger_binding(pb_type_info.binding_name):
                 trigger_metadata = invoc_request.trigger_metadata
             else:
                 trigger_metadata = None
 
-            args[pb.name] = bindings.from_incoming_proto(
+            args[pb.name] = from_incoming_proto(
                 pb_type_info.binding_name,
                 pb,
                 trigger_metadata=trigger_metadata,
                 pytype=pb_type_info.pytype,
-                shmem_mgr=self._shmem_mgr,
-                function_name=self._functions.get_function(
+                function_name=_functions.get_function(
                     function_id).name,
                 is_deferred_binding=pb_type_info.deferred_bindings_enabled)
 
@@ -209,8 +215,8 @@ async def invocation_request(self, request):
             await sync_http_request(http_request, func_http_request)
             args[trigger_arg_name] = http_request
 
-        fi_context = self._get_context(invoc_request, fi.name,
-                                       fi.directory)
+        fi_context = _get_context(invoc_request, fi.name,
+                                  fi.directory)
 
         # Use local thread storage to store the invocation ID
         # for a customer's threads
@@ -220,18 +226,18 @@ async def invocation_request(self, request):
 
         if fi.output_types:
             for name in fi.output_types:
-                args[name] = bindings.Out()
+                args[name] = Out()
 
         if fi.is_async:
-            if self._azure_monitor_available:
-                self.configure_opentelemetry(fi_context)
+            if OTelManager.get_azure_monitor_available():
+                configure_opentelemetry(fi_context)
 
-            call_result = \
-                await self._run_async_func(fi_context, fi.func, args)
+            call_result = await execute(fi.func, **args)  # Not supporting Extensions
         else:
-            call_result = await self._loop.run_in_executor(
-                self._sync_call_tp,
-                self._run_sync_func,
+            _loop = get_current_loop()
+            call_result = await _loop.run_in_executor(
+                threadpool,
+                run_sync_func(),
                 invocation_id, fi_context, fi.func, args)
 
         if call_result is not None and not fi.has_return:
@@ -243,7 +249,6 @@ async def invocation_request(self, request):
             http_coordinator.set_http_response(invocation_id, call_result)
 
         output_data = []
-        cache_enabled = self._function_data_cache_enabled
         if fi.output_types:
             for out_name, out_type_info in fi.output_types.items():
                 val = args[out_name].get()
@@ -252,19 +257,20 @@ async def invocation_request(self, request):
                     # Can "None" be marshaled into protos.TypedData?
                     continue
 
-                param_binding = bindings.to_outgoing_param_binding(
+                param_binding = to_outgoing_param_binding(
                     out_type_info.binding_name, val,
                     pytype=out_type_info.pytype,
-                    out_name=out_name, shmem_mgr=self._shmem_mgr,
-                    is_function_data_cache_enabled=cache_enabled)
+                    out_name=out_name,
+                    protos=protos)
                 output_data.append(param_binding)
 
         return_value = None
         if fi.return_type is not None and not http_v2_enabled:
-            return_value = bindings.to_outgoing_proto(
+            return_value = to_outgoing_proto(
                 fi.return_type.binding_name,
                 call_result,
                 pytype=fi.return_type.pytype,
+                protos=protos
             )
 
         # Actively flush customer print() function to console
@@ -286,7 +292,7 @@ async def invocation_request(self, request):
                                   "message": metadata_exception})
 
 
-async def function_environment_reload_request(self, request):
+async def function_environment_reload_request(request):
     """Only runs on Linux Consumption placeholder specialization.
     This is called only when placeholder mode is true. On worker restarts
     worker init request will be called directly.
@@ -309,19 +315,19 @@ async def function_environment_reload_request(self, request):
         if get_app_setting(
                 setting=PYTHON_ENABLE_OPENTELEMETRY,
                 default_value=PYTHON_ENABLE_OPENTELEMETRY_DEFAULT):
-            self.initialize_azure_monitor()
+            initialize_azure_monitor()
 
-            if self._azure_monitor_available:
+            if OTelManager.get_azure_monitor_available():
                 capabilities[WORKER_OPEN_TELEMETRY_ENABLED] = (
                     TRUE)
 
         try:
-            global result
+            global _host, result
             result = asyncio.create_task(load_function_metadata(directory,
                                                                 caller_info="environment_reload_request"))
             if get_app_setting(setting=PYTHON_ENABLE_INIT_INDEXING):  # PYTHON_ENABLE_HTTP_STREAMING
                 capabilities[HTTP_URI] = \
-                    initialize_http_server(self._host)
+                    initialize_http_server(_host)
                 capabilities[REQUIRES_ROUTE_PARAMETERS] = TRUE
         except HttpServerInitError:
             raise
@@ -329,7 +335,7 @@ async def function_environment_reload_request(self, request):
         # Change function app directory
         if getattr(func_env_reload_request,
                    'function_app_directory', None):
-            self._change_cwd(
+            change_cwd(
                 func_env_reload_request.function_app_directory)
 
         return WorkerResponse(name="function_environment_reload_request",
@@ -346,3 +352,70 @@ async def function_environment_reload_request(self, request):
                        result={"capabilities": capabilities},
                        exception={"status_code": ex.status_code, "type": type(ex),
                                   "message": ex})  # Todo: syntax for getting exception status code
+
+
+async def load_function_metadata(protos, function_app_directory, caller_info):
+    """
+    This method is called to index the functions in the function app
+    directory and save the results in function_metadata_result or
+    function_metadata_exception in case of an exception.
+    """
+    script_file_name = get_app_setting(
+        setting=PYTHON_SCRIPT_FILE_NAME,
+        default_value=f'{PYTHON_SCRIPT_FILE_NAME_DEFAULT}')
+
+    logger.debug(
+        'Received load metadata request from %s, '
+        'script_file_name: %s',
+        caller_info, script_file_name)
+
+    validate_script_file_name(script_file_name)
+    function_path = os.path.join(function_app_directory,
+                                 script_file_name)
+
+    # For V1, the function path will not exist and
+    # return None.
+    global metadata_result
+    metadata_result = (
+        index_functions(protos, function_path, function_app_directory)) \
+        if os.path.exists(function_path) else None
+
+
+async def index_functions(protos, function_path: str, function_dir: str):
+    indexed_functions = index_function_app(function_path)
+    logger.info(
+        "Indexed function app and found %s functions",
+        len(indexed_functions)
+    )
+
+    if indexed_functions:
+        fx_metadata_results, fx_bindings_logs = (
+            process_indexed_function(
+                protos,
+                _functions,
+                indexed_functions,
+                function_dir))
+
+        indexed_function_logs: List[str] = []
+        indexed_function_bindings_logs = []
+        for func in indexed_functions:
+            func_binding_logs = fx_bindings_logs.get(func)
+            for binding in func.get_bindings():
+                deferred_binding_info = func_binding_logs.get(
+                    binding.name)\
+                    if func_binding_logs.get(binding.name) else ""
+                indexed_function_bindings_logs.append((
+                    binding.type, binding.name, deferred_binding_info))
+
+            function_log = "Function Name: {}, Function Binding: {}" \
+                .format(func.get_function_name(),
+                        indexed_function_bindings_logs)
+            indexed_function_logs.append(function_log)
+
+        logger.info(
+            'Successfully processed FunctionMetadataRequest for '
+            'functions: %s. Deferred bindings enabled: %s.', " ".join(
+                indexed_function_logs),
+            _functions.deferred_bindings_enabled())
+
+        return fx_metadata_results
