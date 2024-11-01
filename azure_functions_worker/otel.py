@@ -37,7 +37,7 @@ class OTelManager:
         return self._trace_context_propagator
 
 
-def update_opentelemetry_status(self):
+def update_opentelemetry_status():
     """Check for OpenTelemetry library availability and
     update the status attribute."""
     try:
@@ -55,10 +55,10 @@ def update_opentelemetry_status(self):
         )
 
 
-def initialize_azure_monitor(self):
+def initialize_azure_monitor():
     """Initializes OpenTelemetry and Azure monitor distro
     """
-    self.update_opentelemetry_status()
+    update_opentelemetry_status()
     try:
         from azure.monitor.opentelemetry import configure_azure_monitor
 

@@ -15,7 +15,7 @@ from typing import Dict, Optional
 from .functions import Registry
 from .logging import logger
 
-from bindings.meta import get_deferred_raw_bindings
+from .bindings.meta import get_deferred_raw_bindings
 from .bindings.retrycontext import RetryPolicy
 from .utils.constants import (
     CUSTOMER_PACKAGES_PATH,

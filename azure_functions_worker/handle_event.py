@@ -20,7 +20,7 @@ from .http_v2 import (
 )
 from .loader import index_function_app, process_indexed_function
 from .logging import logger
-from .otel import OTelManager, initialize_azure_monitor, configure_opentelemetry
+from .otel import otel_manager, initialize_azure_monitor, configure_opentelemetry
 
 from .bindings.context import _get_context
 from .bindings.meta import load_binding_registry, is_trigger_binding, from_incoming_proto, to_outgoing_param_binding, to_outgoing_proto
@@ -47,7 +47,7 @@ from .utils.env_state import get_app_setting, is_envvar_true
 from .utils.path import change_cwd
 from .utils.validators import validate_script_file_name
 
-metadata_result: str = ""
+metadata_result: Optional[List] = None
 metadata_exception: Optional[Exception] = None
 result = None  # Todo: type is coroutine?
 _functions = Registry()
@@ -97,7 +97,7 @@ async def worker_init_request(request):
                        default_value=PYTHON_ENABLE_OPENTELEMETRY_DEFAULT):
         initialize_azure_monitor()
 
-        if OTelManager.get_azure_monitor_available():
+        if otel_manager.get_azure_monitor_available():
             capabilities[WORKER_OPEN_TELEMETRY_ENABLED] = TRUE
 
 
@@ -109,7 +109,7 @@ async def worker_init_request(request):
         result = asyncio.create_task(load_function_metadata(protos,
                                                             init_request.function_app_directory,
                                                             caller_info="worker_init_request"))
-        if get_app_setting(setting=PYTHON_ENABLE_INIT_INDEXING): # PYTHON_ENABLE_HTTP_STREAMING
+        if get_app_setting(setting=PYTHON_ENABLE_INIT_INDEXING):  # PYTHON_ENABLE_HTTP_STREAMING
             capabilities[HTTP_URI] = \
                 initialize_http_server(_host)
             capabilities[REQUIRES_ROUTE_PARAMETERS] = TRUE
@@ -120,9 +120,9 @@ async def worker_init_request(request):
         global metadata_exception
         metadata_exception = ex
         return WorkerResponse(name="worker_init_request",
-                       status=Status.ERROR,
-                       result={"capabilities": capabilities},
-                       exception={"status_code": ex.status_code, "type": type(ex), "message": ex}) # Todo: syntax for getting exception status code
+                              status=Status.ERROR,
+                              result={"capabilities": capabilities},
+                              exception={"type": type(ex), "message": ex})
 
     return WorkerResponse(name="worker_init_request",
                           status=Status.SUCCESS,
@@ -133,18 +133,16 @@ async def worker_init_request(request):
 # worker_status_request can be done in the proxy worker
 
 async def functions_metadata_request(request):
-    metadata_request = request.functions_metadata_request
-    function_app_directory = metadata_request.function_app_directory
-
     # Todo: should there be a check on if result is None?
     global result, metadata_result, metadata_exception
-    await result
+    if result:
+        await result
 
     if metadata_exception:
         return WorkerResponse(name="functions_metadata_request",
                               status=Status.ERROR,
                               result={},  # We don't need to send anything if there's an error
-                              exception={"status_code": metadata_exception.status, "type": type(metadata_exception), "message": metadata_exception})
+                              exception={"type": type(metadata_exception), "message": metadata_exception})
     else:
         return WorkerResponse(name="functions_metadata_request",
                               status=Status.SUCCESS,
@@ -226,7 +224,7 @@ async def invocation_request(request):
                 args[name] = Out()
 
         if fi.is_async:
-            if OTelManager.get_azure_monitor_available():
+            if otel_manager.get_azure_monitor_available():
                 configure_opentelemetry(fi_context)
 
             call_result = await execute(fi.func, **args)  # Not supporting Extensions
@@ -234,7 +232,7 @@ async def invocation_request(request):
             _loop = get_current_loop()
             call_result = await _loop.run_in_executor(
                 threadpool,
-                run_sync_func(),
+                run_sync_func,
                 invocation_id, fi_context, fi.func, args)
 
         if call_result is not None and not fi.has_return:
@@ -283,10 +281,10 @@ async def invocation_request(request):
             http_coordinator.set_http_response(invocation_id, ex)
 
         return WorkerResponse(name="invocation_request",
-                       status=Status.ERROR,
-                       result={},  # We don't need to send anything if there's an error
-                       exception={"status_code": metadata_exception.status, "type": type(metadata_exception),
-                                  "message": metadata_exception})
+                              status=Status.ERROR,
+                              result={},  # We don't need to send anything if there's an error
+                              exception={"type": type(metadata_exception),
+                                         "message": metadata_exception})
 
 
 async def function_environment_reload_request(request):
@@ -297,7 +295,7 @@ async def function_environment_reload_request(request):
     try:
 
         func_env_reload_request = \
-            request.function_environment_reload_request
+            request.request.function_environment_reload_request
         directory = func_env_reload_request.function_app_directory
 
         if is_envvar_true(PYTHON_ENABLE_DEBUG_LOGGING):
@@ -314,13 +312,16 @@ async def function_environment_reload_request(request):
                 default_value=PYTHON_ENABLE_OPENTELEMETRY_DEFAULT):
             initialize_azure_monitor()
 
-            if OTelManager.get_azure_monitor_available():
+            if otel_manager.get_azure_monitor_available():
                 capabilities[WORKER_OPEN_TELEMETRY_ENABLED] = (
                     TRUE)
 
         try:
             global _host, result
-            result = asyncio.create_task(load_function_metadata(directory,
+            _host = request.properties.get("host")
+            protos = request.properties.get("protos")
+            result = asyncio.create_task(load_function_metadata(protos,
+                                                                directory,
                                                                 caller_info="environment_reload_request"))
             if get_app_setting(setting=PYTHON_ENABLE_INIT_INDEXING):  # PYTHON_ENABLE_HTTP_STREAMING
                 capabilities[HTTP_URI] = \
@@ -345,10 +346,10 @@ async def function_environment_reload_request(request):
         global metadata_exception
         metadata_exception = ex
         return WorkerResponse(name="function_environment_reload_request",
-                       status=Status.ERROR,
-                       result={"capabilities": capabilities},
-                       exception={"status_code": ex.status_code, "type": type(ex),
-                                  "message": ex})  # Todo: syntax for getting exception status code
+                              status=Status.ERROR,
+                              result={"capabilities": {}},  # We don't need to send anything if it fails
+                              exception={"type": type(ex),
+                                         "message": ex})
 
 
 async def load_function_metadata(protos, function_app_directory, caller_info):
@@ -373,12 +374,11 @@ async def load_function_metadata(protos, function_app_directory, caller_info):
     # For V1, the function path will not exist and
     # return None.
     global metadata_result
-    metadata_result = (
-        index_functions(protos, function_path, function_app_directory)) \
+    metadata_result = (index_functions(protos, function_path, function_app_directory)) \
         if os.path.exists(function_path) else None
 
 
-async def index_functions(protos, function_path: str, function_dir: str):
+def index_functions(protos, function_path: str, function_dir: str):
     indexed_functions = index_function_app(function_path)
     logger.info(
         "Indexed function app and found %s functions",
